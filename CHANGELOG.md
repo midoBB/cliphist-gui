@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://www.github.com/sentriz/cliphist/compare/v0.5.0...v0.6.0) (2024-05-26)
+
+
+### Features
+
+* add -preview-width option to limit char width of preview  ([#88](https://www.github.com/sentriz/cliphist/issues/88)) ([4714de1](https://www.github.com/sentriz/cliphist/commit/4714de1cc6c58854a42199598b5e926f1fd50e4e))
+* make db path configurable (flag / env var / config file) ([19ef90e](https://www.github.com/sentriz/cliphist/commit/19ef90ee35e6e3b27219d38ee43c82f52402431b)), closes [#91](https://www.github.com/sentriz/cliphist/issues/91)
+* support configuration via env var or config file ([#90](https://www.github.com/sentriz/cliphist/issues/90)) ([08ee1fb](https://www.github.com/sentriz/cliphist/commit/08ee1fbe04610b01c0bd70fb9492f2338e1b9f4d))
+
+
+### Bug Fixes
+
+* correctly truncate utf-8 string ([9128c08](https://www.github.com/sentriz/cliphist/commit/9128c08fd4e24464ddcede6c5a0d32dabfc1ec09)), closes [#82](https://www.github.com/sentriz/cliphist/issues/82)
+
 ## [0.5.0](https://www.github.com/sentriz/cliphist/compare/v0.4.0...v0.5.0) (2023-12-12)
 
 
