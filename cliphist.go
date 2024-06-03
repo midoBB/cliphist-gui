@@ -9,10 +9,14 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"net"
 	"os"
+	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "embed"
@@ -20,14 +24,36 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 
+	"fyne.io/systray"
+	bolt "go.etcd.io/bbolt"
 	"go.senan.xyz/flagconf"
 	_ "golang.org/x/image/bmp"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 //go:embed version.txt
 var version string
+
+//go:embed clipboard.png
+var AppIcon []byte
+
+const dbp = "$HOME/.cache/cliphist/db"
+
+// createLockFile creates and locks a file to ensure only one instance of the systray application is running.
+func createLockFile(lockFilePath string) (*os.File, error) {
+	file, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to obtain an exclusive lock.
+	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("another systray instance is already running")
+	}
+
+	return file, nil
+}
 
 //nolint:errcheck
 func main() {
@@ -44,43 +70,45 @@ func main() {
 	maxItems := flag.Uint64("max-items", 750, "maximum number of items to store")
 	maxDedupeSearch := flag.Uint64("max-dedupe-search", 100, "maximum number of last items to look through when finding duplicates")
 	previewWidth := flag.Uint("preview-width", 100, "maximum number of characters to preview")
-	dbPath := flag.String("db-path", "$XDG_CACHE_HOME/cliphist/db", "path to db")
+	// dbPath := flag.String("db-path", "$XDG_CACHE_HOME/cliphist/db", "path to db")
 	configPath := flag.String("config-path", "$XDG_CONFIG_HOME/cliphist/config", "overwrite config path to use instead of cli flags")
 
 	flag.Parse()
 	flagconf.ParseEnv()
 	flagconf.ParseConfig(*configPath)
 
-	*dbPath = os.ExpandEnv(*dbPath)
-
+	dbPath := os.ExpandEnv(dbp)
+	socketPath := "/tmp/cliphist.sock"
+	lockFilePath := "/tmp/myapp.lock"
 	var err error
 	switch flag.Arg(0) {
 	case "store":
 		switch os.Getenv("CLIPBOARD_STATE") { // from man wl-clipboard
 		case "sensitive":
 		case "clear":
-			err = deleteLast(*dbPath)
+			err = deleteLast(dbPath, socketPath)
 		default:
-			err = store(*dbPath, os.Stdin, *maxDedupeSearch, *maxItems)
+			err = store(dbPath, os.Stdin, *maxDedupeSearch, *maxItems, socketPath)
 		}
 	case "list":
-		err = list(*dbPath, os.Stdout, *previewWidth)
+		err = list(dbPath, os.Stdout, *previewWidth)
 	case "decode":
-		err = decode(*dbPath, os.Stdin, os.Stdout, flag.Arg(1))
+		err = decode(dbPath, os.Stdin, os.Stdout, flag.Arg(1))
 	case "delete-query":
-		err = deleteQuery(*dbPath, flag.Arg(1))
+		err = deleteQuery(dbPath, flag.Arg(1), socketPath)
 	case "delete":
-		err = delete(*dbPath, os.Stdin)
+		err = delete(dbPath, os.Stdin, socketPath)
 	case "wipe":
-		err = wipe(*dbPath)
+		err = wipe(dbPath, socketPath)
 	case "version":
 		fmt.Fprintf(flag.CommandLine.Output(), "%s\t%s\n", "version", strings.TrimSpace(version))
 		flag.VisitAll(func(f *flag.Flag) {
 			fmt.Fprintf(flag.CommandLine.Output(), "%s\t%s\n", f.Name, f.Value)
 		})
 	default:
-		flag.Usage()
-		os.Exit(1)
+		systray.Run(func() {
+			onReady(socketPath, lockFilePath)
+		}, func() {})
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -88,7 +116,136 @@ func main() {
 	}
 }
 
-func store(dbPath string, in io.Reader, maxDedupeSearch, maxItems uint64) error {
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	// Read the incoming message
+	buffer := make([]byte, 1024)
+	_, err := conn.Read(buffer)
+	if err != nil {
+		fmt.Println("Error reading:", err.Error())
+		return
+	}
+	loadSysTrayItems()
+}
+
+func loadSysTrayItems() {
+	dbPath := os.ExpandEnv(dbp)
+	systray.ResetMenu()
+	result, _ := listWithLimit(dbPath, 10, 50)
+	for _, v := range result {
+		addClipItem(v, dbPath)
+	}
+	systray.AddSeparator()
+	addQuitItem()
+}
+
+func startServer(socketPath string) {
+	// Remove the socket file if it already exists
+	if err := os.RemoveAll(socketPath); err != nil {
+		fmt.Println("Error removing existing socket file:", err.Error())
+		os.Exit(1)
+	}
+
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		fmt.Println("Error starting server:", err.Error())
+		os.Exit(1)
+	}
+	defer listener.Close()
+
+	fmt.Println("Server started, waiting for connections...")
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection:", err.Error())
+			continue
+		}
+		go handleConnection(conn)
+	}
+}
+
+func addQuitItem() {
+	mQuit := systray.AddMenuItem("Quit", "Quit the whole app")
+	mQuit.Enable()
+	go func() {
+		<-mQuit.ClickedCh
+		fmt.Println("Requesting quit")
+		systray.Quit()
+		fmt.Println("Finished quitting")
+	}()
+	systray.AddSeparator()
+}
+
+func onReady(socketPath string, lockFilePath string) {
+	// Ensure the socket is not already in use
+	if err := os.RemoveAll(socketPath); err != nil {
+		fmt.Println("Error removing existing socket file:", err.Error())
+		os.Exit(1)
+	}
+	// Ensure single systray instance
+	lockFile, err := createLockFile(lockFilePath)
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+	defer lockFile.Close()
+	defer os.Remove(lockFilePath)
+	go startServer(socketPath)
+	loadSysTrayItems()
+	systray.SetTitle("Cliphist GUI")
+	systray.SetIcon(AppIcon)
+	systray.SetTooltip("Clipboard history manager for Wayland")
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	<-signalChannel
+}
+
+func sendNotification(socketPath string) {
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		fmt.Println("Error connecting:", err.Error())
+		return
+	}
+	defer conn.Close()
+
+	message := "Command executed in another mode"
+	_, err = conn.Write([]byte(message))
+	if err != nil {
+		fmt.Println("Error sending message:", err.Error())
+	}
+}
+
+func addClipItem(v *PreviewItem, dbpath string) {
+	mClipItem := systray.AddMenuItem(v.Value, "")
+	mClipItem.Enable()
+	go func(v *PreviewItem) {
+		<-mClipItem.ClickedCh
+
+		// Create a pipe
+		r, w := io.Pipe()
+
+		// Start wl-copy command
+		cmd := exec.Command("wl-copy")
+		cmd.Stdin = r
+
+		// Start the wl-copy command in a goroutine
+		go func() {
+			if err := cmd.Run(); err != nil {
+				fmt.Printf("wl-copy command failed: %v\n", err)
+			}
+			r.Close()
+		}()
+
+		// Call decodeFromId with the write end of the pipe
+		err := decodeFromId(dbpath, v.Key, w)
+		if err != nil {
+			fmt.Printf("decodeFromId failed: %v\n", err)
+		}
+		w.Close()
+	}(v)
+}
+
+func store(dbPath string, in io.Reader, maxDedupeSearch, maxItems uint64, socketPath string) error {
 	input, err := io.ReadAll(in)
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
@@ -131,6 +288,7 @@ func store(dbPath string, in io.Reader, maxDedupeSearch, maxItems uint64) error 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	sendNotification(socketPath)
 	return nil
 }
 
@@ -170,6 +328,42 @@ func deduplicate(b *bolt.Bucket, input []byte, maxDedupeSearch uint64) error {
 		seen++
 	}
 	return nil
+}
+
+type PreviewItem struct {
+	Key   uint64
+	Value string
+}
+
+func listWithLimit(dbPath string, limit uint, previewWidth uint) ([]*PreviewItem, error) {
+	db, err := initDBReadOnly(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening db: %w", err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin(false)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	b := tx.Bucket([]byte(bucketKey))
+	c := b.Cursor()
+	res := make([]*PreviewItem, 0)
+	i := uint(0)
+	for k, v := c.Last(); k != nil && i < limit; {
+		res = append(res, &PreviewItem{
+			Key:   btoi(k),
+			Value: previewNoIndex(v, previewWidth),
+		})
+		if k == nil || i >= limit {
+			break
+		}
+		k, v = c.Prev()
+		i++
+	}
+	return res, nil
 }
 
 func list(dbPath string, out io.Writer, previewWidth uint) error {
@@ -240,7 +434,28 @@ func decode(dbPath string, in io.Reader, out io.Writer, input string) error {
 	return nil
 }
 
-func deleteQuery(dbPath string, query string) error {
+func decodeFromId(dbPath string, id uint64, out io.Writer) error {
+	db, err := initDBReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("opening db: %w", err)
+	}
+	defer db.Close()
+
+	tx, err := db.Begin(false)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	b := tx.Bucket([]byte(bucketKey))
+	v := b.Get(itob(id))
+	if _, err := out.Write(v); err != nil {
+		return fmt.Errorf("writing out: %w", err)
+	}
+	return nil
+}
+
+func deleteQuery(dbPath string, query string, socketPath string) error {
 	if query == "" {
 		return fmt.Errorf("please provide a query")
 	}
@@ -268,10 +483,11 @@ func deleteQuery(dbPath string, query string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	sendNotification(socketPath)
 	return nil
 }
 
-func deleteLast(dbPath string) error {
+func deleteLast(dbPath string, socketPath string) error {
 	db, err := initDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening db: %w", err)
@@ -292,10 +508,11 @@ func deleteLast(dbPath string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	sendNotification(socketPath)
 	return nil
 }
 
-func delete(dbPath string, in io.Reader) error {
+func delete(dbPath string, in io.Reader, socketPath string) error {
 	input, err := io.ReadAll(in) // drain stdin before opening and locking db
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
@@ -326,10 +543,11 @@ func delete(dbPath string, in io.Reader) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	sendNotification(socketPath)
 	return nil
 }
 
-func wipe(dbPath string) error {
+func wipe(dbPath string, socketPath string) error {
 	db, err := initDB(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening db: %w", err)
@@ -351,6 +569,7 @@ func wipe(dbPath string) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
 	}
+	sendNotification(socketPath)
 	return nil
 }
 
@@ -389,6 +608,18 @@ func initDBOption(path string, ro bool) (*bolt.DB, error) {
 		return nil, fmt.Errorf("init bucket: %w", err)
 	}
 	return db, nil
+}
+
+func previewNoIndex(data []byte, width uint) string {
+	if config, format, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		return fmt.Sprintf("[[ binary data %s %s %dx%d ]]",
+			sizeStr(len(data)), format, config.Width, config.Height)
+	}
+	prev := string(data)
+	prev = strings.TrimSpace(prev)
+	prev = strings.Join(strings.Fields(prev), " ")
+	prev = trunc(prev, int(width), "…")
+	return prev
 }
 
 func preview(index uint64, data []byte, width uint) string {

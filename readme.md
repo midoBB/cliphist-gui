@@ -1,5 +1,6 @@
 ### cliphist
 
+This application has been designed using images from Flaticon.com
 _clipboard history “manager” for wayland_
 
 - write clipboard changes to a history file
@@ -28,22 +29,27 @@ image mime inferance)
 
 ### usage
 
+#### Show Tray icon
+
+`$ cliphist &`
+This is only allowed once per session as you can't have multiple instances of the tray icon running at the same time.
+
 #### listen for clipboard changes
 
-`$ wl-paste --watch cliphist store`  
+`$ wl-paste --watch cliphist store`
 this will listen for changes on your primary keyboard and write it to
-the history.  
+the history.
 call it once per session - for example in your sway config
 
 #### select old item
 
-`$ cliphist list | dmenu | cliphist decode | wl-copy`  
+`$ cliphist list | dmenu | cliphist decode | wl-copy`
 bind it to something nice on your keyboard
 
 #### delete old item
 
-`$ cliphist list | dmenu | cliphist delete`  
-or else query manually  
+`$ cliphist list | dmenu | cliphist delete`
+or else query manually
 `$ cliphist delete-query "secret item"`
 
 #### clear database
@@ -96,13 +102,15 @@ or else query manually
 <details>
   <summary>wofi</summary>
 
-  `cliphist list | wofi -S dmenu | cliphist decode | wl-copy`
+`cliphist list | wofi -S dmenu | cliphist decode | wl-copy`
 
-  Example config for sway:
+Example config for sway:
+
 ```
 exec wl-paste --watch cliphist store
 bindsym Mod1+p exec cliphist list | wofi -S dmenu | cliphist decode | wl-copy
 ```
+
 </details>
 
 ---
