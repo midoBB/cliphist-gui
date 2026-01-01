@@ -503,7 +503,9 @@ func deleteLast(dbPath string, socketPath string) error {
 	b := tx.Bucket([]byte(bucketKey))
 	c := b.Cursor()
 	k, _ := c.Last()
-	_ = b.Delete(k)
+	if k != nil {
+		_ = b.Delete(k)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit tx: %w", err)
